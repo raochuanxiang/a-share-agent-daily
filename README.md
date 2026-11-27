@@ -1,7 +1,9 @@
 # A股智能体概念股日报
 
-工作日北京时间 11:00 自动获取 Eastmoney AI/智能体概念板块成分股，按综合热度排序取 Top 10，为每只股票附短摘要和当日新闻链接，并推送飞书。
+GitHub Actions 工作日北京时间 11:00 获取东方财富 AI/智能体概念板块，按成交额40%、涨跌幅30%、主力净流入20%、当日个股新闻条数10%的横截面百分位综合分选 Top 10，推送飞书。
 
-见 [部署说明](docs/deploy.md) 与 [流程图](docs/flowchart.mmd)。运行前需在 GitHub 仓库添加 Actions Secret `FEISHU_WEBHOOK`。
+- 流程图：[docs/flowchart.mmd](docs/flowchart.mmd)
+- 部署说明：[docs/deploy.md](docs/deploy.md)
+- 飞书机器人 Webhook 通过 Actions Secret `FEISHU_WEBHOOK` 提供。
 
-评分采用成交额和涨跌幅的横截面百分位；当前程序的资金流、新闻提及热度暂为中性分，报告会明示这一限制，不能视为原定权重的完整实现。
+数据由 AkShare 转接东方财富公开接口；接口变更或缺字段会让运行失败以避免静默生成错误排名。新闻热度以各股新闻接口当天返回记录数近似。仅供信息参考，不构成投资建议。

@@ -1,81 +1,148 @@
-"""Daily A-share AI agent concept report, powered by Eastmoney via AkShare."""
+"""A股智能体概念股日报：Eastmoney data via AkShare, delivered to Feishu."""
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-import requests
+from zoneinfo import ZoneInfo
+
 import akshare as ak
+import pandas as pd
+import requests
 
-KEYWORDS = ("AI", "智能体", "AIAgent")
+BEIJING = ZoneInfo("Asia/Shanghai")
+CONCEPT_PATTERN = r"AI|AIAgent|智能体|大模型|人工智能"
 
-def pick_col(df, choices):
-    return next((c for c in choices if c in df.columns), None)
+
+def choose(df, *names):
+    return next((name for name in names if name in df.columns), None)
+
+
+def percentile(series):
+    """Cross-sectional percentile; ties receive the average rank."""
+    values = pd.to_numeric(series, errors="coerce")
+    return values.rank(pct=True, method="average").fillna(0) * 100
+
+
+def fetch_news(code, name, today):
+    """Return today's news count and the most recent available title/link."""
+    df = ak.stock_news_em(symbol=code)
+    if df is None or df.empty:
+        return code, 0, f"{name} 新闻搜索", f"https://so.eastmoney.com/news/s?keyword={name}"
+    title_col = choose(df, "新闻标题", "标题", "title")
+    url_col = choose(df, "新闻链接", "链接", "url")
+    time_col = choose(df, "发布时间", "新闻时间", "public_time", "时间")
+    if not title_col or not url_col or not time_col:
+        raise RuntimeError(f"{code} 新闻字段变化: {list(df.columns)}")
+    published = pd.to_datetime(df[time_col], errors="coerce")
+    count = int((published.dt.date == today).sum())
+    first = df.iloc[0]
+    return code, count, str(first[title_col]), str(first[url_col])
+
 
 def collect():
     boards = ak.stock_board_concept_name_em()
-    name_col = pick_col(boards, ["板块名称", "名称"])
-    if not name_col:
-        raise RuntimeError(f"无法识别概念板块字段: {list(boards.columns)}")
-    selected = boards[boards[name_col].astype(str).apply(lambda n: any(k.lower() in n.lower() for k in KEYWORDS))]
+    board_col = choose(boards, "板块名称", "名称")
+    if not board_col:
+        raise RuntimeError(f"概念板块字段变化: {list(boards.columns)}")
+    selected = boards[boards[board_col].astype(str).str.contains(CONCEPT_PATTERN, case=False, regex=True)]
     if selected.empty:
-        raise RuntimeError("未找到名称含 AI/智能体 的概念板块；请在 src/main.py 配置实际板块名")
-    frames = []
-    for board in selected[name_col].tolist():
-        try:
-            df = ak.stock_board_concept_cons_em(symbol=board)
-            frames.append(df)
-        except Exception as e:
-            print(f"跳过板块 {board}: {e}")
-    if not frames:
-        raise RuntimeError("概念板块成分股获取失败")
-    import pandas as pd
-    all_df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["代码"])
-    amount = pick_col(all_df, ["成交额", "成交额(元)"])
-    change = pick_col(all_df, ["涨跌幅", "涨跌幅(%)"])
-    code = pick_col(all_df, ["代码", "股票代码"])
-    name = pick_col(all_df, ["名称", "股票简称"])
-    if not all([amount, change, code, name]):
-        raise RuntimeError(f"成分股行情字段不全: {list(all_df.columns)}")
-    all_df[amount] = pd.to_numeric(all_df[amount], errors="coerce").fillna(0)
-    all_df[change] = pd.to_numeric(all_df[change], errors="coerce").fillna(0)
-    # Source lacks a consistently available net-flow field; use a transparent neutral component.
-    all_df["_flow"] = 0.0
-    def pct_rank(s):
-        return s.rank(pct=True).fillna(0) * 100
-    all_df["_score"] = .4*pct_rank(all_df[amount]) + .3*pct_rank(all_df[change]) + .2*pct_rank(all_df["_flow"]) + .1*50
-    out=[]
-    for _, row in all_df.nlargest(10, "_score").iterrows():
-        ticker = str(row[code]).zfill(6)
-        title, url = news(ticker, str(row[name]))
-        summary = f"{row[name]}当日涨跌{float(row[change]):.2f}%，成交额{float(row[amount])/1e8:.2f}亿元；热度分{row['_score']:.1f}。"
-        out.append((ticker, str(row[name]), summary[:49], title, url))
-    return out
+        raise RuntimeError("没有找到 AI/智能体相关概念板块，请检查 Eastmoney 当前板块名称")
 
-def news(code, name):
-    try:
-        df = ak.stock_news_em(symbol=code)
-        if not df.empty:
-            c = pick_col(df, ["新闻标题", "标题"]); u = pick_col(df, ["新闻链接", "链接"])
-            if c and u:
-                return str(df.iloc[0][c]), str(df.iloc[0][u])
-    except Exception as e:
-        print(f"新闻抓取失败 {code}: {e}")
-    return f"{name}新闻搜索", f"https://so.eastmoney.com/news/s?keyword={name}"
+    frames = []
+    for board in selected[board_col].tolist():
+        frame = ak.stock_board_concept_cons_em(symbol=board)
+        if frame is not None and not frame.empty:
+            frames.append(frame)
+    if not frames:
+        raise RuntimeError("概念板块成分股为空")
+    stocks = pd.concat(frames, ignore_index=True)
+    code_col = choose(stocks, "代码", "股票代码")
+    name_col = choose(stocks, "名称", "股票简称")
+    amount_col = choose(stocks, "成交额", "成交额(元)")
+    change_col = choose(stocks, "涨跌幅", "涨跌幅(%)")
+    if not all((code_col, name_col, amount_col, change_col)):
+        raise RuntimeError(f"成分股行情字段变化: {list(stocks.columns)}")
+    stocks[code_col] = stocks[code_col].astype(str).str.zfill(6)
+    stocks = stocks.drop_duplicates(subset=[code_col]).copy()
+    stocks[amount_col] = pd.to_numeric(stocks[amount_col], errors="coerce")
+    stocks[change_col] = pd.to_numeric(stocks[change_col], errors="coerce")
+
+    # One Eastmoney ranking request provides today's main net inflow for the market.
+    flow = ak.stock_individual_fund_flow_rank(indicator="今日")
+    flow_code = choose(flow, "代码", "股票代码")
+    flow_value = choose(flow, "今日主力净流入-净额", "主力净流入-净额", "今日主力净流入", "主力净流入")
+    if not flow_code or not flow_value:
+        raise RuntimeError(f"资金流字段变化: {list(flow.columns)}")
+    flow = flow[[flow_code, flow_value]].copy()
+    flow[flow_code] = flow[flow_code].astype(str).str.zfill(6)
+    flow[flow_value] = pd.to_numeric(flow[flow_value], errors="coerce")
+    stocks = stocks.merge(flow, left_on=code_col, right_on=flow_code, how="left")
+    if stocks[flow_value].isna().all():
+        raise RuntimeError("概念成分股未匹配到当日主力净流入数据")
+
+    today = datetime.now(BEIJING).date()
+    news_data = {}
+    # Moderate concurrency keeps the per-stock news requests practical without hammering the source.
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(fetch_news, row[code_col], str(row[name_col]), today): row[code_col]
+            for _, row in stocks.iterrows()
+        }
+        for future in as_completed(futures):
+            code, count, title, url = future.result()
+            news_data[code] = (count, title, url)
+    stocks["_news_count"] = stocks[code_col].map(lambda code: news_data[code][0])
+    stocks["_news_title"] = stocks[code_col].map(lambda code: news_data[code][1])
+    stocks["_news_url"] = stocks[code_col].map(lambda code: news_data[code][2])
+
+    stocks["_score"] = (
+        0.40 * percentile(stocks[amount_col])
+        + 0.30 * percentile(stocks[change_col])
+        + 0.20 * percentile(stocks[flow_value])
+        + 0.10 * percentile(stocks["_news_count"])
+    )
+    top = stocks.nlargest(10, "_score")
+    result = []
+    for _, row in top.iterrows():
+        amount_yi = float(row[amount_col]) / 1e8
+        flow_yi = float(row[flow_value]) / 1e8
+        summary = (
+            f"{row[name_col]}涨跌{float(row[change_col]):.2f}%，成交额{amount_yi:.2f}亿元，"
+            f"主力净流入{flow_yi:.2f}亿元，今日新闻{int(row['_news_count'])}条。"
+        )
+        result.append({
+            "code": row[code_col], "name": row[name_col], "summary": summary,
+            "score": float(row["_score"]), "news_title": row["_news_title"], "news_url": row["_news_url"],
+        })
+    return result
+
 
 def main():
     webhook = os.environ.get("FEISHU_WEBHOOK")
     if not webhook:
-        raise RuntimeError("请设置 FEISHU_WEBHOOK 环境变量")
+        raise RuntimeError("缺少 GitHub Actions Secret: FEISHU_WEBHOOK")
+    report_date = datetime.now(BEIJING).strftime("%Y-%m-%d")
     rows = collect()
-    date = datetime.now().strftime("%Y-%m-%d")
-    text = f"A股智能体概念股日报 {date}\n热度分=成交额40%+涨跌幅30%+资金净流入20%+新闻提及10%。行情源无一致可用的资金净流入/新闻量数据时，对该分项使用中性分，不伪造数值。\n\n"
-    for i, (code, name, summary, title, url) in enumerate(rows, 1):
-        text += f"{i}. {name} ({code})\n{summary}\n新闻：[ {title} ]({url})\n\n"
-    resp = requests.post(webhook, json={"msg_type":"text", "content":{"text":text}}, timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("code", 0) != 0:
-        raise RuntimeError(f"飞书推送失败: {data}")
-    print(text)
+    lines = [
+        f"A股 AI/智能体概念股日报 {report_date}",
+        "综合热度分 = 成交额40% + 涨跌幅30% + 主力净流入20% + 当日个股新闻条数10%（均按概念股横截面百分位）",
+        "数据源：东方财富，经 AkShare 获取；新闻数为东方财富个股新闻接口当日记录数。仅供信息参考，不构成投资建议。", "",
+    ]
+    for i, row in enumerate(rows, 1):
+        lines.extend([
+            f"{i}. {row['name']}（{row['code']}）｜热度 {row['score']:.1f}",
+            row["summary"],
+            f"关键新闻：{row['news_title']} {row['news_url']}", "",
+        ])
+    message = "\n".join(lines)
+    response = requests.post(
+        webhook, json={"msg_type": "text", "content": {"text": message}}, timeout=30
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code", 0) != 0:
+        raise RuntimeError(f"飞书机器人返回错误: {payload}")
+    print(message)
+
 
 if __name__ == "__main__":
     main()
-
