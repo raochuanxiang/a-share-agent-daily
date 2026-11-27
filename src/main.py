@@ -80,7 +80,7 @@ def collect():
     stocks[change_col] = pd.to_numeric(stocks[change_col], errors="coerce")
 
     # One Eastmoney ranking request provides today's main net inflow for the market.
-    flow = source_call(ak.stock_individual_fund_flow_rank, indicator="今日")
+    flow = source_call(ak.stock_fund_flow_individual_rank_em, indicator="今日")
     flow_code = choose(flow, "代码", "股票代码")
     flow_value = choose(flow, "今日主力净流入-净额", "主力净流入-净额", "今日主力净流入", "主力净流入")
     if not flow_code or not flow_value:
@@ -160,3 +160,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
