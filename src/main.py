@@ -1,7 +1,7 @@
 """A股智能体概念股日报：Eastmoney data via AkShare, delivered to Feishu."""
 import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+import time
 from zoneinfo import ZoneInfo
 
 import akshare as ak
@@ -10,6 +10,19 @@ import requests
 
 BEIJING = ZoneInfo("Asia/Shanghai")
 CONCEPT_PATTERN = r"AI|AIAgent|智能体|大模型|人工智能"
+
+
+def source_call(function, *args, **kwargs):
+    """Retry Eastmoney's temporary Push2 IP ban once after its documented cooldown."""
+    try:
+        return function(*args, **kwargs)
+    except Exception as exc:
+        if "Push2RateLimitError" not in type(exc).__name__:
+            raise
+        wait_seconds = int(os.environ.get("EASTMONEY_COOLDOWN_SECONDS", "360"))
+        print(f"Eastmoney temporary rate limit; wait {wait_seconds}s before one retry")
+        time.sleep(wait_seconds)
+        return function(*args, **kwargs)
 
 
 def choose(df, *names):
@@ -24,7 +37,7 @@ def percentile(series):
 
 def fetch_news(code, name, today):
     """Return today's news count and the most recent available title/link."""
-    df = ak.stock_news_em(symbol=code)
+    df = source_call(ak.stock_news_em, symbol=code)
     if df is None or df.empty:
         return code, 0, f"{name} 新闻搜索", f"https://so.eastmoney.com/news/s?keyword={name}"
     title_col = choose(df, "新闻标题", "标题", "title")
@@ -39,7 +52,7 @@ def fetch_news(code, name, today):
 
 
 def collect():
-    boards = ak.stock_board_concept_name_em()
+    boards = source_call(ak.stock_board_concept_name_em)
     board_col = choose(boards, "板块名称", "名称")
     if not board_col:
         raise RuntimeError(f"概念板块字段变化: {list(boards.columns)}")
@@ -49,7 +62,7 @@ def collect():
 
     frames = []
     for board in selected[board_col].tolist():
-        frame = ak.stock_board_concept_cons_em(symbol=board)
+        frame = source_call(ak.stock_board_concept_cons_em, symbol=board)
         if frame is not None and not frame.empty:
             frames.append(frame)
     if not frames:
@@ -67,7 +80,7 @@ def collect():
     stocks[change_col] = pd.to_numeric(stocks[change_col], errors="coerce")
 
     # One Eastmoney ranking request provides today's main net inflow for the market.
-    flow = ak.stock_individual_fund_flow_rank(indicator="今日")
+    flow = source_call(ak.stock_individual_fund_flow_rank, indicator="今日")
     flow_code = choose(flow, "代码", "股票代码")
     flow_value = choose(flow, "今日主力净流入-净额", "主力净流入-净额", "今日主力净流入", "主力净流入")
     if not flow_code or not flow_value:
@@ -79,28 +92,29 @@ def collect():
     if stocks[flow_value].isna().all():
         raise RuntimeError("概念成分股未匹配到当日主力净流入数据")
 
-    today = datetime.now(BEIJING).date()
-    news_data = {}
-    # Moderate concurrency keeps the per-stock news requests practical without hammering the source.
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(fetch_news, row[code_col], str(row[name_col]), today): row[code_col]
-            for _, row in stocks.iterrows()
-        }
-        for future in as_completed(futures):
-            code, count, title, url = future.result()
-            news_data[code] = (count, title, url)
-    stocks["_news_count"] = stocks[code_col].map(lambda code: news_data[code][0])
-    stocks["_news_title"] = stocks[code_col].map(lambda code: news_data[code][1])
-    stocks["_news_url"] = stocks[code_col].map(lambda code: news_data[code][2])
-
-    stocks["_score"] = (
+    # Bound per-stock news requests: first shortlist by the 90% of metrics available
+    # in bulk, then fetch news serially for the strongest 30 candidates.
+    stocks["_base_score"] = (
         0.40 * percentile(stocks[amount_col])
         + 0.30 * percentile(stocks[change_col])
         + 0.20 * percentile(stocks[flow_value])
-        + 0.10 * percentile(stocks["_news_count"])
     )
-    top = stocks.nlargest(10, "_score")
+    candidates = stocks.nlargest(min(30, len(stocks)), "_base_score").copy()
+    today = datetime.now(BEIJING).date()
+    news_data = {}
+    for _, row in candidates.iterrows():
+        code, count, title, url = fetch_news(row[code_col], str(row[name_col]), today)
+        news_data[code] = (count, title, url)
+        time.sleep(0.6)
+    candidates["_news_count"] = candidates[code_col].map(lambda code: news_data[code][0])
+    candidates["_news_title"] = candidates[code_col].map(lambda code: news_data[code][1])
+    candidates["_news_url"] = candidates[code_col].map(lambda code: news_data[code][2])
+
+    candidates["_score"] = (
+        candidates["_base_score"]
+        + 0.10 * percentile(candidates["_news_count"])
+    )
+    top = candidates.nlargest(10, "_score")
     result = []
     for _, row in top.iterrows():
         amount_yi = float(row[amount_col]) / 1e8
@@ -124,7 +138,7 @@ def main():
     rows = collect()
     lines = [
         f"A股 AI/智能体概念股日报 {report_date}",
-        "综合热度分 = 成交额40% + 涨跌幅30% + 主力净流入20% + 当日个股新闻条数10%（均按概念股横截面百分位）",
+        "综合热度分 = 成交额40% + 涨跌幅30% + 主力净流入20% + 当日个股新闻条数10%；新闻项在基础分前30候选股中排名。",
         "数据源：东方财富，经 AkShare 获取；新闻数为东方财富个股新闻接口当日记录数。仅供信息参考，不构成投资建议。", "",
     ]
     for i, row in enumerate(rows, 1):
